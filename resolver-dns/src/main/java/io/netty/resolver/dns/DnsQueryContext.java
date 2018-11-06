@@ -114,10 +114,10 @@ final class DnsQueryContext implements FutureListener<AddressedEnvelope<DnsRespo
     }
 
     private void sendQuery(final DnsQuery query, final ChannelPromise writePromise) {
-        if (parent.channelFuture.isDone()) {
+        if (parent.channelFuture().isDone()) {
             writeQuery(query, writePromise);
         } else {
-            parent.channelFuture.addListener(new GenericFutureListener<Future<? super Channel>>() {
+            parent.channelFuture().addListener(new GenericFutureListener<Future<? super Channel>>() {
                 @Override
                 public void operationComplete(Future<? super Channel> future) {
                     if (future.isSuccess()) {

@@ -20,11 +20,11 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.AddressedEnvelope;
 import io.netty.channel.Channel;
+import io.netty.channel.ChannelDuplexHandler;
 import io.netty.channel.ChannelFactory;
 import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelFutureListener;
 import io.netty.channel.ChannelHandlerContext;
-import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.channel.ChannelInitializer;
 import io.netty.channel.ChannelOption;
 import io.netty.channel.ChannelPromise;
@@ -47,6 +47,7 @@ import io.netty.resolver.InetNameResolver;
 import io.netty.resolver.ResolvedAddressTypes;
 import io.netty.util.NetUtil;
 import io.netty.util.ReferenceCountUtil;
+import io.netty.util.concurrent.EventExecutor;
 import io.netty.util.concurrent.FastThreadLocal;
 import io.netty.util.concurrent.Future;
 import io.netty.util.concurrent.FutureListener;
@@ -159,7 +160,6 @@ public class DnsNameResolver extends InetNameResolver {
     private static final DatagramDnsResponseDecoder DECODER = new DatagramDnsResponseDecoder();
     private static final DatagramDnsQueryEncoder ENCODER = new DatagramDnsQueryEncoder();
 
-    final Future<Channel> channelFuture;
     final Channel ch;
 
     // Comparator that ensures we will try first to use the nameservers that use our preferred address type.
@@ -201,6 +201,7 @@ public class DnsNameResolver extends InetNameResolver {
     private final DnsRecordType[] resolveRecordTypes;
     private final boolean decodeIdn;
     private final DnsQueryLifecycleObserverFactory dnsQueryLifecycleObserverFactory;
+    private final DnsResolverHandler handler;
 
     /**
      * Creates a new DNS-based name resolver that communicates with the specified list of DNS servers.
@@ -382,15 +383,14 @@ public class DnsNameResolver extends InetNameResolver {
         b.group(executor());
         b.channelFactory(channelFactory);
         b.option(ChannelOption.DATAGRAM_CHANNEL_ACTIVE_ON_REGISTRATION, true);
-        final DnsResponseHandler responseHandler = new DnsResponseHandler(executor().<Channel>newPromise());
+        handler = new DnsResolverHandler(executor().<Channel>newPromise());
         b.handler(new ChannelInitializer<DatagramChannel>() {
             @Override
             protected void initChannel(DatagramChannel ch) throws Exception {
-                ch.pipeline().addLast(DECODER, ENCODER, responseHandler);
+                ch.pipeline().addLast(DECODER, ENCODER, handler);
             }
         });
 
-        channelFuture = responseHandler.channelActivePromise;
         ChannelFuture future = b.register();
         Throwable cause = future.cause();
         if (cause != null) {
@@ -426,6 +426,10 @@ public class DnsNameResolver extends InetNameResolver {
         default:
             throw new IllegalArgumentException("Unknown ResolvedAddressTypes " + resolvedAddressTypes);
         }
+    }
+
+    Future<Channel> channelFuture() {
+        return handler.channelActivePromise;
     }
 
     // Only here to override in unit tests.
@@ -962,14 +966,45 @@ public class DnsNameResolver extends InetNameResolver {
         }
     }
 
-    private void doResolveAllUncached(String hostname,
+    private void doResolveAllUncached(final String hostname,
+                                      final DnsRecord[] additionals,
+                                      final Promise<List<InetAddress>> promise,
+                                      final DnsCache resolveCache) {
+        EventExecutor executor = executor();
+        if (executor.inEventLoop()) {
+            doResolveAllUncached0(hostname, additionals, promise, resolveCache);
+        } else {
+            try {
+                executor.execute(new Runnable() {
+                    @Override
+                    public void run() {
+                        doResolveAllUncached0(hostname, additionals, promise, resolveCache);
+                    }
+                });
+            } catch (Throwable cause) {
+                promise.setFailure(cause);
+            }
+        }
+    }
+
+    private void doResolveAllUncached0(String hostname,
                                       DnsRecord[] additionals,
                                       Promise<List<InetAddress>> promise,
                                       DnsCache resolveCache) {
-        final DnsServerAddressStream nameServerAddrs =
-                dnsServerAddressStreamProvider.nameServerAddressStream(hostname);
-        new DnsAddressResolveContext(this, hostname, additionals, nameServerAddrs,
-                                     resolveCache, authoritativeDnsServerCache).resolve(promise);
+
+        try {
+            // As the resolve(...) method may trigger multiple flush() operations lets just suppress these until we
+            // are done with the resolve(...) operation and then flush all together to reduce syscalls.
+            handler.supressFlushes();
+
+            final DnsServerAddressStream nameServerAddrs =
+                    dnsServerAddressStreamProvider.nameServerAddressStream(hostname);
+            new DnsAddressResolveContext(this, hostname, additionals, nameServerAddrs,
+                                         resolveCache, authoritativeDnsServerCache).resolve(promise);
+        } finally {
+            // Flush now if needed.
+            handler.mayFlush();
+        }
     }
 
     private static String hostname(String inetHost) {
@@ -1100,16 +1135,22 @@ public class DnsNameResolver extends InetNameResolver {
         return dnsServerAddressStreamProvider.nameServerAddressStream(hostname);
     }
 
-    private final class DnsResponseHandler extends ChannelInboundHandlerAdapter {
+    private final class DnsResolverHandler extends ChannelDuplexHandler {
 
         private final Promise<Channel> channelActivePromise;
+        private ChannelHandlerContext ctx;
+        private boolean supressFlushes;
+        private boolean needsFlush;
 
-        DnsResponseHandler(Promise<Channel> channelActivePromise) {
+        DnsResolverHandler(Promise<Channel> channelActivePromise) {
             this.channelActivePromise = channelActivePromise;
         }
 
         @Override
         public void channelRead(ChannelHandlerContext ctx, Object msg) {
+            // Let's supress flushes until channelReadComplete is triggered or a flush is explict requested to reduce
+            // syscalls.
+            supressFlushes = true;
             try {
                 final DatagramDnsResponse res = (DatagramDnsResponse) msg;
                 final int queryId = res.id();
@@ -1132,13 +1173,63 @@ public class DnsNameResolver extends InetNameResolver {
 
         @Override
         public void channelActive(ChannelHandlerContext ctx) throws Exception {
-            super.channelActive(ctx);
+            ctx.fireChannelActive();
             channelActivePromise.setSuccess(ctx.channel());
         }
 
         @Override
         public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
             logger.warn("{} Unexpected exception: ", ch, cause);
+        }
+
+        @Override
+        public void handlerAdded(ChannelHandlerContext ctx) throws Exception {
+            this.ctx = ctx;
+        }
+
+        @Override
+        public void handlerRemoved(ChannelHandlerContext ctx) throws Exception {
+            mayFlush();
+        }
+
+        @Override
+        public void close(ChannelHandlerContext ctx, ChannelPromise promise) throws Exception {
+            mayFlush();
+
+            ctx.close(promise);
+        }
+
+        @Override
+        public void flush(ChannelHandlerContext ctx) throws Exception {
+            if (supressFlushes) {
+                // We will flush later either by calling mayFlush() from channelReadComplete(...) or by call it
+                // explicit.
+                needsFlush = true;
+                return;
+            }
+            super.flush(ctx);
+        }
+
+        @Override
+        public void channelReadComplete(ChannelHandlerContext ctx) throws Exception {
+            try {
+                ctx.fireChannelReadComplete();
+            } finally {
+                mayFlush();
+            }
+        }
+
+        void supressFlushes() {
+            assert ctx.executor().inEventLoop();
+            supressFlushes = true;
+        }
+
+        void mayFlush() {
+            assert ctx.executor().inEventLoop();
+            supressFlushes = false;
+            if (needsFlush) {
+                ctx.flush();
+            }
         }
     }
 }
