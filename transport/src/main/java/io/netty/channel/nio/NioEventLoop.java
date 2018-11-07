@@ -676,6 +676,12 @@ public final class NioEventLoop extends SingleThreadEventLoop {
         }
     }
 
+    @Override
+    protected boolean removeTask(Runnable task) {
+        // Not supported
+        return false;
+    }
+
     private void closeAll() {
         selectAgain();
         Set<SelectionKey> keys = selector.keys();

@@ -170,6 +170,12 @@ class EpollEventLoop extends SingleThreadEventLoop {
         }
     }
 
+    @Override
+    protected boolean removeTask(Runnable task) {
+        // Not supported
+        return false;
+    }
+
     /**
      * Register the given epoll with this {@link EventLoop}.
      */

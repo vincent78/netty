@@ -331,6 +331,9 @@ public abstract class SingleThreadEventExecutor extends AbstractScheduledEventEx
     }
 
     /**
+     * Will remove the {@link Runnable} from the task {@link Queue}. Returns {@code true} if it could be removed or
+     * {@code false} if not.
+     *
      * @see Queue#remove(Object)
      */
     protected boolean removeTask(Runnable task) {
@@ -778,6 +781,7 @@ public abstract class SingleThreadEventExecutor extends AbstractScheduledEventEx
         addTask(task);
         if (!inEventLoop) {
             startThread();
+
             if (isShutdown() && removeTask(task)) {
                 reject();
             }

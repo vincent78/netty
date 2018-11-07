@@ -114,6 +114,12 @@ final class KQueueEventLoop extends SingleThreadEventLoop {
     }
 
     @Override
+    protected boolean removeTask(Runnable task) {
+        // Not supported
+        return false;
+    }
+
+    @Override
     protected void wakeup(boolean inEventLoop) {
         if (!inEventLoop && WAKEN_UP_UPDATER.compareAndSet(this, 0, 1)) {
             wakeup();
